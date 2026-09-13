@@ -67,6 +67,14 @@ eel.Start()
 eel.Stop()
 ```
 
+## Benchmarks
+
+Reproducible simulator benchmark suite with charts: **[benchmark/](benchmark/README.md)**
+— colocated vs PD-disaggregated vs elastic across burst/load sweeps. Colocated TPOT p99
+inflates **133×** under a 6× burst; disaggregated stays flat at 0.5ms. Real-GPU validation
+plan (vLLM/SGLang on A10 / free Colab T4): [`benchmark/GPU_PLAN.md`](benchmark/GPU_PLAN.md)
++ ready-to-run notebook [`benchmark/colab_t4_bench.ipynb`](benchmark/colab_t4_bench.ipynb).
+
 ## Architecture
 
 ```
