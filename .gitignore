@@ -1,0 +1,15 @@
+# Binaries
+bin/
+*.exe
+pdserve
+
+# Test artifacts
+*.out
+*.test
+coverage.html
+
+# Editor/OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
