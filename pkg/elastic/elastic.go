@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Akhilesh-Chandewar/pdserve/pkg/clock"
 	"github.com/Akhilesh-Chandewar/pdserve/pkg/engine"
 	"github.com/Akhilesh-Chandewar/pdserve/pkg/metrics"
 	"github.com/Akhilesh-Chandewar/pdserve/pkg/scheduler"
@@ -27,7 +28,6 @@ type ElasticEngine struct {
 	mu    sync.Mutex
 	flips []FlipEvent
 	stop  chan struct{}
-	wg    sync.WaitGroup
 
 	closed bool
 }
@@ -55,6 +55,9 @@ func NewElastic(cfg engine.Config) (*ElasticEngine, error) {
 	}, nil
 }
 
+// Engine exposes the wrapped engine (flip primitive, drain model).
+func (e *ElasticEngine) Engine() *engine.DisaggregatedEngine { return e.eng }
+
 // Name implements engine.Engine.
 func (e *ElasticEngine) Name() string {
 	return fmt.Sprintf("elastic(%s, flips=%d)", e.eng.Name(), len(e.Flips()))
@@ -69,6 +72,9 @@ func (e *ElasticEngine) Queue() *scheduler.Queue { return e.eng.Queue() }
 // PoolSizes implements engine.Engine.
 func (e *ElasticEngine) PoolSizes() (int, int) { return e.eng.PoolSizes() }
 
+// InFlight implements engine.Engine.
+func (e *ElasticEngine) InFlight() int { return e.eng.InFlight() }
+
 // Flips returns recorded flip events.
 func (e *ElasticEngine) Flips() []FlipEvent {
 	e.mu.Lock()
@@ -76,11 +82,35 @@ func (e *ElasticEngine) Flips() []FlipEvent {
 	return append([]FlipEvent(nil), e.flips...)
 }
 
-// Start implements engine.Engine; it also starts the monitor loop.
+// Start implements engine.Engine; it also starts the clock-driven monitor.
+// The monitor is a self-perpetuating timer chain on the engine's clock: it
+// fires as part of the same event stream as arrivals and workers, so Sim runs
+// stay deterministic and Real runs need no extra goroutine.
 func (e *ElasticEngine) Start() {
 	e.eng.Start()
-	e.wg.Add(1)
-	go e.monitorLoop()
+	e.scheduleTick(e.eng.Clock())
+}
+
+// Run implements engine.Engine by delegating to the wrapped engine.
+func (e *ElasticEngine) Run() { e.eng.Run() }
+
+// RunUntil implements engine.Engine by delegating to the wrapped engine.
+func (e *ElasticEngine) RunUntil(d time.Duration) { e.eng.RunUntil(d) }
+
+// scheduleTick schedules the next monitor evaluation. Stop breaks the chain;
+// the chain also retires once the engine is quiescent (arrivals done, nothing
+// in flight or queued), so Sim runs reach the empty-queue state and drain.
+func (e *ElasticEngine) scheduleTick(clk clock.Clock) {
+	clk.AfterFunc(MonitorInterval, func() {
+		if e.isStopped() {
+			return
+		}
+		e.evaluate()
+		if e.eng.ArrivalsDone() && e.eng.InFlight() == 0 && e.Queue().Len() == 0 {
+			return // quiescent: retire the monitor chain
+		}
+		e.scheduleTick(clk)
+	})
 }
 
 // Stop drains and shuts down the engine and monitor.
@@ -94,23 +124,19 @@ func (e *ElasticEngine) Stop() {
 	close(e.stop)
 	e.mu.Unlock()
 	e.eng.Stop()
-	e.wg.Wait()
 }
 
-func (e *ElasticEngine) monitorLoop() {
-	defer e.wg.Done()
-	tick := time.NewTicker(MonitorInterval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-e.stop:
-			return
-		case <-tick.C:
-			e.evaluate()
-		}
+// isStopped reports whether Stop has been called.
+func (e *ElasticEngine) isStopped() bool {
+	select {
+	case <-e.stop:
+		return true
+	default:
+		return false
 	}
 }
 
+// evaluate samples the current window and applies the policy decision.
 func (e *ElasticEngine) evaluate() {
 	snap := e.eng.Registry().Snapshot()
 	if snap.Completed < 8 {
@@ -118,7 +144,7 @@ func (e *ElasticEngine) evaluate() {
 	}
 	pre, dec := e.eng.PoolSizes()
 	sig := Signal{
-		Now:               time.Now(),
+		Now:               e.eng.Clock().Now(),
 		QueueDepthPrefill: e.Queue().Len(),
 		TTFTP99us:         snap.TTFTP99us,
 		TPOTP99us:         snap.TPOTP99us,
@@ -133,10 +159,9 @@ func (e *ElasticEngine) evaluate() {
 	}
 }
 
-// applyFlip moves GPUs between pools and records the event. In production
-// this is where a worker would drain, rebind its role, and rejoin the other
-// pool with weights still resident. In the simulation we record the flip and
-// delegate pool resizing to the disaggregated engine.
+// applyFlip moves GPUs between pools and records the event. The underlying
+// ResizePools drains each flipped worker's in-flight step before rebinding
+// (P0-4 fix) and charges the modeled drain latency as simulated time.
 func (e *ElasticEngine) applyFlip(d Decision) {
 	e.mu.Lock()
 	flip := FlipEvent{At: time.Now(), Count: 1}

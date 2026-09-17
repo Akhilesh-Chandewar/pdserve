@@ -1,7 +1,7 @@
-# Binaries
+# Binaries (root-anchored: must not ignore cmd/pdserve source)
 bin/
 *.exe
-pdserve
+/pdserve
 
 # Test artifacts
 *.out

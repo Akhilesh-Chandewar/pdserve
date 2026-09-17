@@ -3,9 +3,8 @@
 package engine
 
 import (
-	"time"
-
-	"github.com/Akhilesh-Chandewar/pdserve/pkg/metrics"
+	"github.com/Akhilesh-Chandewar/pdserve/pkg/clock"
+	"github.com/Akhilesh-Chandewar/pdserve/pkg/rng"
 	"github.com/Akhilesh-Chandewar/pdserve/pkg/scheduler"
 )
 
@@ -23,15 +22,15 @@ type LoadSpec struct {
 	BurstFactor float64
 	// BurstLenSec is how long each burst lasts.
 	BurstLenSec float64
-	// PromptTokensMean / Stddev: lognormal-ish prompt size distribution.
+	// PromptTokensMean / Std: prompt size distribution.
 	PromptTokensMean int
 	PromptTokensStd  int
-	// OutputTokensMean / Std: uniform-ish output length distribution.
+	// OutputTokensMean / Std: output length distribution.
 	OutputTokensMean int
 	OutputTokensStd  int
 }
 
-// DefaultLoad returns a 60s run at 4 req/s with one 5s burst at t=20s.
+// DefaultLoad returns a 30s run at 4 req/s with one 5s burst at t=20s.
 func DefaultLoad() LoadSpec {
 	return LoadSpec{
 		Seed:             42,
@@ -47,32 +46,23 @@ func DefaultLoad() LoadSpec {
 	}
 }
 
-// ArrivalGen generates requests onto a queue following LoadSpec.
+// ArrivalGen generates requests following LoadSpec. All randomness flows
+// through one serialized RNG and all time flows through a Clock, so a given
+// seed + clock produces a fully determined arrival stream (P1-2).
 type ArrivalGen struct {
-	q    *scheduler.Queue
 	spec LoadSpec
-	rng  *metrics.RNG
+	rng  *rng.RNG
+	clk  clock.Clock
 }
 
-// NewArrivalGen binds a generator to an admission queue.
-func NewArrivalGen(q *scheduler.Queue, spec LoadSpec) *ArrivalGen {
-	return &ArrivalGen{q: q, spec: spec, rng: metrics.NewRNG(spec.Seed)}
+// NewArrivalGen binds a generator to a clock.
+func NewArrivalGen(clk clock.Clock, spec LoadSpec) *ArrivalGen {
+	return &ArrivalGen{spec: spec, rng: rng.NewRNG(spec.Seed), clk: clk}
 }
 
-// Pump emits all requests that should have arrived by time t (start-relative).
-// Call it periodically from the engine's arrival loop.
-func (g *ArrivalGen) Pump(now time.Time) {
-	g.q.Push(g.Next(now))
-}
-
-// Next returns the batch of requests that arrived between the previous call
-// and now. It is safe for concurrent use by one arrival loop.
-func (g *ArrivalGen) Next(now time.Time) *scheduler.Request {
-	return g.makeRequest(now)
-}
-
-// makeRequest samples prompt/output sizes and stamps arrival.
-func (g *ArrivalGen) makeRequest(now time.Time) *scheduler.Request {
+// makeRequest samples prompt/output sizes and stamps arrival at current
+// clock time.
+func (g *ArrivalGen) makeRequest() *scheduler.Request {
 	prompt := g.rng.Norm(float64(g.spec.PromptTokensMean), float64(g.spec.PromptTokensStd))
 	if prompt < 32 {
 		prompt = 32
@@ -85,8 +75,16 @@ func (g *ArrivalGen) makeRequest(now time.Time) *scheduler.Request {
 		ID:           scheduler.NewRequestID(),
 		PromptTokens: int(prompt),
 		MaxOutput:    int(out),
-		Arrival:      now,
+		Arrival:      g.clk.Now(),
 	}
+}
+
+// Next returns the request that arrived at the current clock instant. The
+// engine drives arrivals by scheduling timers at each sampled inter-arrival
+// time (not by polling), so Next is called exactly once per arrival event and
+// the RNG stream is fully determined by the seed.
+func (g *ArrivalGen) Next() *scheduler.Request {
+	return g.makeRequest()
 }
 
 // NextInterarrivalUS returns the next inter-arrival time in microseconds given

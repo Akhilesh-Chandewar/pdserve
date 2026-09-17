@@ -3,13 +3,8 @@
 package kvcache
 
 import (
-	"bufio"
-	"encoding/binary"
 	"fmt"
-	"io"
-	"net"
 	"sync"
-	"time"
 )
 
 // Block is one page of the paged KV cache.
@@ -134,11 +129,13 @@ func (p *Pool) Allocate(requestID string, nblocks int) ([]*Block, error) {
 }
 
 // Connector transfers a KV-cache handle from a prefill worker to a decode
-// worker. Implementations: MemoryConnector (same process, zero-copy) and
-// TCPConnector (network transfer, models RDMA cost via bandwidth).
+// worker. Implementations model the transfer cost analytically (P1-8):
+// measuring loopback TCP says nothing about an RDMA fabric, so the sim path
+// has no sockets at all.
 type Connector interface {
-	// Send blocks until the KV blocks have been "transmitted" to dst.
-	Send(reqID string, blocks []*Block, dst string) error
+	// TransferTimeUS returns modeled transfer latency in microseconds for
+	// the given blocks.
+	TransferTimeUS(blocks []*Block) float64
 	// Name identifies the connector in benchmarks.
 	Name() string
 }
@@ -147,102 +144,36 @@ type Connector interface {
 // shared pool). Transfer cost is ~0.
 type MemoryConnector struct{}
 
-// Send implements Connector.
-func (MemoryConnector) Send(string, []*Block, string) error { return nil }
+// TransferTimeUS implements Connector.
+func (MemoryConnector) TransferTimeUS([]*Block) float64 { return 0 }
 
 // Name implements Connector.
 func (MemoryConnector) Name() string { return "memory(zero-copy)" }
 
-// TCPConnector streams blocks over TCP. Transfer time is
-// bytes / bandwidthGBps, modeling RDMA-class fabrics when bandwidth is high.
+// TCPConnector models a network KV transfer (RDMA-class fabrics when
+// bandwidth is high) as bytes / bandwidth. Purely analytic.
 type TCPConnector struct {
 	BandwidthGBps float64
-	listener      net.Listener
-	addr          string
-	wg            sync.WaitGroup
 }
 
-// NewTCPConnector starts a local listener for KV transfers.
+// NewTCPConnector builds an analytic TCP-bandwidth connector.
 func NewTCPConnector(bandwidthGBps float64) (*TCPConnector, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
+	if bandwidthGBps <= 0 {
+		return nil, fmt.Errorf("tcp connector bandwidth must be > 0, got %v", bandwidthGBps)
 	}
-	c := &TCPConnector{BandwidthGBps: bandwidthGBps, listener: l, addr: l.Addr().String()}
-	c.wg.Add(1)
-	go c.serve()
-	return c, nil
+	return &TCPConnector{BandwidthGBps: bandwidthGBps}, nil
 }
 
-// Addr returns the listener address.
-func (c *TCPConnector) Addr() string { return c.addr }
-
-// Close shuts the listener down.
-func (c *TCPConnector) Close() error {
-	err := c.listener.Close()
-	c.wg.Wait()
-	return err
-}
-
-func (c *TCPConnector) serve() {
-	defer c.wg.Done()
-	for {
-		conn, err := c.listener.Accept()
-		if err != nil {
-			return
-		}
-		go func(conn net.Conn) {
-			defer conn.Close()
-			br := bufio.NewReader(conn)
-			var hdr [8]byte
-			for {
-				if _, err := io.ReadFull(br, hdr[:]); err != nil {
-					return
-				}
-				n := binary.LittleEndian.Uint64(hdr[:])
-				if _, err := io.CopyN(io.Discard, br, int64(n)); err != nil {
-					return
-				}
-			}
-		}(conn)
-	}
-}
-
-// Send implements Connector by streaming serialized blocks over TCP.
-func (c *TCPConnector) Send(reqID string, blocks []*Block, dst string) error {
-	var conn net.Conn
-	var err error
-	if dst != "" {
-		conn, err = net.DialTimeout("tcp", dst, 2*time.Second)
-	} else {
-		conn, err = net.DialTimeout("tcp", c.addr, 2*time.Second)
-	}
-	if err != nil {
-		return fmt.Errorf("kv send dial: %w", err)
-	}
-	defer conn.Close()
-	bw := bufio.NewWriter(conn)
-	var buf [8]byte
-	for _, b := range blocks {
-		payload := make([]byte, b.Bytes)
-		binary.LittleEndian.PutUint64(buf[:], uint64(len(payload)))
-		if _, err := bw.Write(buf[:]); err != nil {
-			return err
-		}
-		if _, err := bw.Write(payload); err != nil {
-			return err
-		}
-	}
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	return nil
+// TransferTimeUS implements Connector.
+func (c *TCPConnector) TransferTimeUS(blocks []*Block) float64 {
+	return TransferTimeUS(blocks, c.BandwidthGBps)
 }
 
 // Name implements Connector.
 func (c *TCPConnector) Name() string { return fmt.Sprintf("tcp(%.0f GB/s)", c.BandwidthGBps) }
 
-// TransferTimeUS estimates transfer latency in microseconds for nblocks.
+// TransferTimeUS estimates transfer latency in microseconds for nblocks at
+// the given fabric bandwidth.
 func TransferTimeUS(blocks []*Block, bandwidthGBps float64) float64 {
 	var bytes int64
 	for _, b := range blocks {

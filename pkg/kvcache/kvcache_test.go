@@ -60,26 +60,30 @@ func TestPoolPinnedNotEvicted(t *testing.T) {
 
 func TestMemoryConnector(t *testing.T) {
 	c := MemoryConnector{}
-	if err := c.Send("r1", nil, "decode-1"); err != nil {
-		t.Fatalf("memory send: %v", err)
+	if us := c.TransferTimeUS(nil); us != 0 {
+		t.Fatalf("memory transfer cost = %f us, want 0", us)
 	}
 	if c.Name() == "" {
 		t.Fatal("connector name empty")
 	}
 }
 
-func TestTCPConnectorRoundTrip(t *testing.T) {
+func TestTCPConnectorAnalytic(t *testing.T) {
+	// P1-8: the connector is purely analytic now — no sockets.
 	c, err := NewTCPConnector(50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
 	blocks := make([]*Block, 4)
 	for i := range blocks {
 		blocks[i] = &Block{ID: "b", Tokens: 16, Bytes: 4096}
 	}
-	if err := c.Send("r1", blocks, ""); err != nil {
-		t.Fatalf("tcp send: %v", err)
+	want := TransferTimeUS(blocks, 50)
+	if got := c.TransferTimeUS(blocks); got != want {
+		t.Fatalf("tcp transfer = %f us, want %f", got, want)
+	}
+	if _, err := NewTCPConnector(0); err == nil {
+		t.Fatal("zero bandwidth must be rejected")
 	}
 }
 
